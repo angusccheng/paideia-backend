@@ -1,6 +1,7 @@
 """
 query.py — POST /query, GET /documents/{student_id}, DELETE /documents/{student_id}.
 These are the endpoints Vapi and the frontend will call during a tutoring session.
+All vectorstore functions are now async (Supabase pgvector via asyncpg).
 """
 
 from fastapi import APIRouter, HTTPException
@@ -34,7 +35,7 @@ class QueryRequest(BaseModel):
 async def query_documents(body: QueryRequest):
     """
     Embed the query string and retrieve the top 5 most relevant chunks
-    from that student's ChromaDB collection.
+    from that student's Supabase pgvector collection.
 
     Vapi calls this endpoint mid-conversation. The returned "context" string
     is injected into the AI's system prompt so it can answer using only the
@@ -45,11 +46,10 @@ async def query_documents(body: QueryRequest):
 
     try:
         # Embed the query using the same model used at upload time
-        # so distances are comparable
         query_embedding = embed_texts([body.query])[0]
 
-        # Retrieve top 5 chunks filtered to this student's collection only
-        chunks = query_chunks(
+        # Retrieve top 5 chunks filtered to this student only
+        chunks = await query_chunks(
             student_id=body.student_id,
             query_embedding=query_embedding,
             top_k=5,
@@ -67,8 +67,6 @@ async def query_documents(body: QueryRequest):
             },
         )
 
-    # Join chunks into a single clean string separated by blank lines.
-    # Vapi's system prompt will receive this as the "context" variable.
     context_string = "\n\n".join(chunks)
 
     return JSONResponse(
@@ -86,12 +84,9 @@ async def query_documents(body: QueryRequest):
 
 @router.get("/documents/{student_id}")
 async def list_documents(student_id: str):
-    """
-    Return the list of unique filenames that have been uploaded
-    and indexed for this student.
-    """
+    """Return the list of unique filenames uploaded and indexed for this student."""
     try:
-        filenames = list_collections_for_student(student_id)
+        filenames = await list_collections_for_student(student_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not retrieve documents: {str(e)}")
 
@@ -111,13 +106,9 @@ async def list_documents(student_id: str):
 
 @router.delete("/documents/{student_id}")
 async def delete_documents(student_id: str):
-    """
-    Delete the entire ChromaDB collection for this student,
-    removing all their uploaded notes and embeddings.
-    Useful when a student wants to start fresh.
-    """
+    """Delete all uploaded notes and embeddings for a student."""
     try:
-        chunks_deleted = delete_student_collection(student_id)
+        chunks_deleted = await delete_student_collection(student_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Delete failed: {str(e)}")
 

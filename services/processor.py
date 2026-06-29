@@ -188,3 +188,37 @@ def process_file(
     ids = [make_chunk_id(student_id, filename, i) for i in range(len(chunks))]
 
     return chunks, embeddings, metadatas, ids
+
+
+# ---------------------------------------------------------------------------
+# Supabase Storage upload
+# ---------------------------------------------------------------------------
+
+def upload_file_to_supabase(
+    file_bytes: bytes,
+    student_id: str,
+    filename: str,
+) -> str:
+    """
+    Upload the raw file to Supabase Storage under the 'student-documents' bucket.
+    Storage path: {student_id}/{filename}
+
+    Storing the original file separately from the chunks means we can
+    re-process it later (e.g. with a better chunking strategy) without
+    asking the student to re-upload.
+
+    Returns the storage path string.
+    """
+    from services.vectorstore import get_supabase_client
+
+    supabase = get_supabase_client()
+    storage_path = f"{student_id}/{filename}"
+
+    # upsert=True overwrites if the same student re-uploads the same filename
+    supabase.storage.from_("student-documents").upload(
+        path=storage_path,
+        file=file_bytes,
+        file_options={"upsert": "true"},
+    )
+
+    return storage_path
