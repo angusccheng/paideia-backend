@@ -1,18 +1,18 @@
 """
-vectorstore.py — Supabase pgvector integration.
-Replaces ChromaDB. All vector storage and retrieval goes through
-a Postgres database with the pgvector extension enabled on Supabase.
+vectorstore.py — Supabase pgvector integration via psycopg2.
+All vector storage and retrieval goes through a Postgres database
+with the pgvector extension enabled on Supabase.
 
 Two clients are used:
-  - supabase-py  → Storage bucket operations (uploading raw files)
-  - asyncpg      → Direct SQL for vector similarity search, because
-                   supabase-py does not support the <=> operator natively
+  - supabase-py  → Storage bucket operations and simple table inserts
+  - psycopg2     → Direct SQL for pgvector similarity search (<=> operator)
 """
 
 import os
 from typing import Optional
 
-import asyncpg
+import psycopg2
+import psycopg2.extras
 from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
@@ -35,46 +35,19 @@ def get_supabase_client() -> Client:
 
 
 # ---------------------------------------------------------------------------
-# asyncpg connection pool (for pgvector SQL queries)
+# psycopg2 connection helper
 # ---------------------------------------------------------------------------
 
-_pool: Optional[asyncpg.Pool] = None
-
-
-async def get_pool() -> asyncpg.Pool:
+def get_connection() -> psycopg2.extensions.connection:
     """
-    Return the shared asyncpg connection pool, creating it on first call.
-    asyncpg is used instead of supabase-py because we need to run raw SQL
-    with the <=> cosine distance operator from pgvector.
+    Open and return a new psycopg2 connection using DATABASE_URL.
+    Each function opens its own connection and closes it when done.
+    This avoids connection pool complexity while keeping things simple.
     """
-    global _pool
-    if _pool is None:
-        database_url = os.getenv("DATABASE_URL")
-        if not database_url:
-            raise EnvironmentError("DATABASE_URL must be set.")
-        # Register a codec so asyncpg can send Python lists as vector[] columns
-        _pool = await asyncpg.create_pool(
-            database_url,
-            min_size=1,
-            max_size=5,
-            init=_register_vector_codec,
-        )
-    return _pool
-
-
-async def _register_vector_codec(connection: asyncpg.Connection) -> None:
-    """
-    Tell asyncpg how to encode/decode the pgvector 'vector' type.
-    Without this, passing a list of floats as a vector column fails.
-    """
-    await connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
-    await connection.set_type_codec(
-        "vector",
-        encoder=lambda v: "[" + ",".join(str(x) for x in v) + "]",
-        decoder=lambda v: [float(x) for x in v.strip("[]").split(",")],
-        schema="pg_catalog",
-        format="text",
-    )
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise EnvironmentError("DATABASE_URL must be set.")
+    return psycopg2.connect(database_url)
 
 
 # ---------------------------------------------------------------------------
@@ -90,10 +63,10 @@ async def upsert_chunks(
 ) -> None:
     """
     Insert or update chunk rows in the 'chunks' table.
-    Uses ON CONFLICT (id) DO UPDATE so re-uploading the same file
+    ON CONFLICT (id) DO UPDATE means re-uploading the same file
     overwrites existing rows rather than creating duplicates.
 
-    Table schema expected:
+    Table schema:
       id          TEXT PRIMARY KEY
       student_id  TEXT NOT NULL
       source      TEXT NOT NULL
@@ -101,35 +74,35 @@ async def upsert_chunks(
       content     TEXT NOT NULL
       embedding   vector(1536) NOT NULL
     """
-    pool = await get_pool()
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            for i in range(len(chunks)):
+                # Convert the Python list to the string format pgvector expects: [0.1,0.2,...]
+                embedding_str = "[" + ",".join(str(x) for x in embeddings[i]) + "]"
 
-    # Build rows as tuples matching the INSERT column order
-    rows = [
-        (
-            ids[i],
-            student_id,
-            metadatas[i].get("source", "unknown"),
-            metadatas[i].get("chunk_index", i),
-            chunks[i],
-            embeddings[i],
-        )
-        for i in range(len(chunks))
-    ]
-
-    async with pool.acquire() as conn:
-        # executemany with upsert — one round-trip per chunk batch
-        await conn.executemany(
-            """
-            INSERT INTO chunks (id, student_id, source, chunk_index, content, embedding)
-            VALUES ($1, $2, $3, $4, $5, $6::vector)
-            ON CONFLICT (id) DO UPDATE SET
-                content    = EXCLUDED.content,
-                embedding  = EXCLUDED.embedding,
-                source     = EXCLUDED.source,
-                chunk_index = EXCLUDED.chunk_index
-            """,
-            rows,
-        )
+                cur.execute(
+                    """
+                    INSERT INTO chunks (id, student_id, source, chunk_index, content, embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s::vector)
+                    ON CONFLICT (id) DO UPDATE SET
+                        content     = EXCLUDED.content,
+                        embedding   = EXCLUDED.embedding,
+                        source      = EXCLUDED.source,
+                        chunk_index = EXCLUDED.chunk_index
+                    """,
+                    (
+                        ids[i],
+                        student_id,
+                        metadatas[i].get("source", "unknown"),
+                        metadatas[i].get("chunk_index", i),
+                        chunks[i],
+                        embedding_str,
+                    ),
+                )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 async def query_chunks(
@@ -143,37 +116,41 @@ async def query_chunks(
 
     Filters strictly by student_id so students never see each other's notes.
     """
-    pool = await get_pool()
-
-    # Convert the embedding list to the string format pgvector expects
+    # Convert the embedding list to the pgvector string format
     embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT content
-            FROM chunks
-            WHERE student_id = $1
-            ORDER BY embedding <=> $2::vector
-            LIMIT $3
-            """,
-            student_id,
-            embedding_str,
-            top_k,
-        )
-
-    return [row["content"] for row in rows]
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT content
+                FROM chunks
+                WHERE student_id = %s
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+                """,
+                (student_id, embedding_str, top_k),
+            )
+            rows = cur.fetchall()
+        return [row[0] for row in rows]
+    finally:
+        conn.close()
 
 
 async def list_collections_for_student(student_id: str) -> list[str]:
     """Return a list of unique source filenames stored for this student."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT DISTINCT source FROM chunks WHERE student_id = $1 ORDER BY source",
-            student_id,
-        )
-    return [row["source"] for row in rows]
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT source FROM chunks WHERE student_id = %s ORDER BY source",
+                (student_id,),
+            )
+            rows = cur.fetchall()
+        return [row[0] for row in rows]
+    finally:
+        conn.close()
 
 
 async def delete_student_collection(student_id: str) -> int:
@@ -181,17 +158,18 @@ async def delete_student_collection(student_id: str) -> int:
     Delete all chunks belonging to this student.
     Returns the number of rows deleted.
     """
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        result = await conn.execute(
-            "DELETE FROM chunks WHERE student_id = $1",
-            student_id,
-        )
-    # asyncpg returns a status string like "DELETE 34" — parse the count
+    conn = get_connection()
     try:
-        return int(result.split()[-1])
-    except (IndexError, ValueError):
-        return 0
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM chunks WHERE student_id = %s",
+                (student_id,),
+            )
+            count = cur.rowcount  # psycopg2 gives the deleted row count directly
+        conn.commit()
+        return count
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -204,17 +182,17 @@ async def save_document_record(
     file_path: str,
 ) -> str:
     """
-    Insert a row into the 'documents' table to track what files
-    a student has uploaded (separate from the chunk rows).
+    Insert a row into the 'documents' table to track uploaded files.
     Returns the new document's id.
 
-    Table schema expected:
+    Table schema:
       id          UUID DEFAULT gen_random_uuid() PRIMARY KEY
       student_id  TEXT NOT NULL
       filename    TEXT NOT NULL
       file_path   TEXT NOT NULL
       created_at  TIMESTAMPTZ DEFAULT now()
     """
+    # Use supabase-py for the simple insert — no vector types involved
     supabase = get_supabase_client()
     response = (
         supabase.table("documents")
