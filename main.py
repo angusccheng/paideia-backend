@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from routes.upload import router as upload_router
 from routes.query import router as query_router
+from routes.voice import router as voice_router
 
 # ---------------------------------------------------------------------------
 # App initialisation
@@ -48,6 +49,9 @@ app.include_router(upload_router)
 
 # Query, list, and delete endpoints: POST /query, GET/DELETE /documents/{id}
 app.include_router(query_router)
+
+# Voice pipeline: WS /voice/session, POST /voice/transcribe, /voice/speak, /voice/respond
+app.include_router(voice_router)
 
 # ---------------------------------------------------------------------------
 # Health check — GET /health
