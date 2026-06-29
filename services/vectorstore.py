@@ -1,22 +1,20 @@
 """
-vectorstore.py — Supabase pgvector integration via psycopg2.
-All vector storage and retrieval goes through a Postgres database
-with the pgvector extension enabled on Supabase.
+vectorstore.py — Supabase pgvector integration using supabase-py only.
+No native database drivers needed — all queries go through the Supabase
+REST API (httpx under the hood), which works on any deployment platform.
 
-Two clients are used:
-  - supabase-py  → Storage bucket operations and simple table inserts
-  - psycopg2     → Direct SQL for pgvector similarity search (<=> operator)
+Vector similarity search uses a Postgres function called via supabase.rpc()
+because the supabase-py client cannot run raw SQL with the <=> operator directly.
+The function must exist in your Supabase database — see README for the SQL.
 """
 
 import os
 from typing import Optional
 
-import psycopg2
-import psycopg2.extras
 from supabase import create_client, Client
 
 # ---------------------------------------------------------------------------
-# Supabase client (for Storage and simple table operations)
+# Supabase client — created once, reused across all requests
 # ---------------------------------------------------------------------------
 
 _supabase_client: Optional[Client] = None
@@ -35,22 +33,6 @@ def get_supabase_client() -> Client:
 
 
 # ---------------------------------------------------------------------------
-# psycopg2 connection helper
-# ---------------------------------------------------------------------------
-
-def get_connection() -> psycopg2.extensions.connection:
-    """
-    Open and return a new psycopg2 connection using DATABASE_URL.
-    Each function opens its own connection and closes it when done.
-    This avoids connection pool complexity while keeping things simple.
-    """
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        raise EnvironmentError("DATABASE_URL must be set.")
-    return psycopg2.connect(database_url)
-
-
-# ---------------------------------------------------------------------------
 # Chunk operations
 # ---------------------------------------------------------------------------
 
@@ -62,9 +44,9 @@ async def upsert_chunks(
     ids: list[str],
 ) -> None:
     """
-    Insert or update chunk rows in the 'chunks' table.
-    ON CONFLICT (id) DO UPDATE means re-uploading the same file
-    overwrites existing rows rather than creating duplicates.
+    Insert or update chunk rows in the 'chunks' table via supabase-py.
+    Supabase upsert uses ON CONFLICT (id) DO UPDATE internally, so
+    re-uploading the same file overwrites rather than duplicates.
 
     Table schema:
       id          TEXT PRIMARY KEY
@@ -74,35 +56,23 @@ async def upsert_chunks(
       content     TEXT NOT NULL
       embedding   vector(1536) NOT NULL
     """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            for i in range(len(chunks)):
-                # Convert the Python list to the string format pgvector expects: [0.1,0.2,...]
-                embedding_str = "[" + ",".join(str(x) for x in embeddings[i]) + "]"
+    supabase = get_supabase_client()
 
-                cur.execute(
-                    """
-                    INSERT INTO chunks (id, student_id, source, chunk_index, content, embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s::vector)
-                    ON CONFLICT (id) DO UPDATE SET
-                        content     = EXCLUDED.content,
-                        embedding   = EXCLUDED.embedding,
-                        source      = EXCLUDED.source,
-                        chunk_index = EXCLUDED.chunk_index
-                    """,
-                    (
-                        ids[i],
-                        student_id,
-                        metadatas[i].get("source", "unknown"),
-                        metadatas[i].get("chunk_index", i),
-                        chunks[i],
-                        embedding_str,
-                    ),
-                )
-        conn.commit()
-    finally:
-        conn.close()
+    # Build the rows list — embedding is passed as a plain Python list,
+    # which Supabase serialises as a JSON array. pgvector accepts this format.
+    rows = [
+        {
+            "id": ids[i],
+            "student_id": student_id,
+            "source": metadatas[i].get("source", "unknown"),
+            "chunk_index": metadatas[i].get("chunk_index", i),
+            "content": chunks[i],
+            "embedding": embeddings[i],   # list[float] → pgvector accepts JSON array
+        }
+        for i in range(len(chunks))
+    ]
+
+    supabase.table("chunks").upsert(rows).execute()
 
 
 async def query_chunks(
@@ -111,46 +81,60 @@ async def query_chunks(
     top_k: int = 5,
 ) -> list[str]:
     """
-    Find the top_k most semantically similar chunks for this student
-    using pgvector cosine distance (<=>).
+    Find the top_k most semantically similar chunks for this student.
 
-    Filters strictly by student_id so students never see each other's notes.
+    Calls the 'match_chunks' Postgres function via supabase.rpc().
+    That function runs the pgvector <=> cosine distance query server-side,
+    which avoids needing a direct database connection from Python.
+
+    The SQL function must exist in your Supabase database:
+      create or replace function match_chunks(
+        p_student_id text,
+        p_embedding  vector(1536),
+        p_limit      int
+      )
+      returns table(content text)
+      language sql as $$
+        select content from chunks
+        where student_id = p_student_id
+        order by embedding <=> p_embedding
+        limit p_limit;
+      $$;
     """
-    # Convert the embedding list to the pgvector string format
-    embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+    supabase = get_supabase_client()
 
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT content
-                FROM chunks
-                WHERE student_id = %s
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (student_id, embedding_str, top_k),
-            )
-            rows = cur.fetchall()
-        return [row[0] for row in rows]
-    finally:
-        conn.close()
+    response = supabase.rpc(
+        "match_chunks",
+        {
+            "p_student_id": student_id,
+            "p_embedding": query_embedding,   # passed as JSON array
+            "p_limit": top_k,
+        },
+    ).execute()
+
+    return [row["content"] for row in (response.data or [])]
 
 
 async def list_collections_for_student(student_id: str) -> list[str]:
     """Return a list of unique source filenames stored for this student."""
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT DISTINCT source FROM chunks WHERE student_id = %s ORDER BY source",
-                (student_id,),
-            )
-            rows = cur.fetchall()
-        return [row[0] for row in rows]
-    finally:
-        conn.close()
+    supabase = get_supabase_client()
+
+    response = (
+        supabase.table("chunks")
+        .select("source")
+        .eq("student_id", student_id)
+        .execute()
+    )
+
+    # Deduplicate while preserving order
+    seen = set()
+    filenames = []
+    for row in (response.data or []):
+        src = row["source"]
+        if src not in seen:
+            seen.add(src)
+            filenames.append(src)
+    return sorted(filenames)
 
 
 async def delete_student_collection(student_id: str) -> int:
@@ -158,18 +142,20 @@ async def delete_student_collection(student_id: str) -> int:
     Delete all chunks belonging to this student.
     Returns the number of rows deleted.
     """
-    conn = get_connection()
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM chunks WHERE student_id = %s",
-                (student_id,),
-            )
-            count = cur.rowcount  # psycopg2 gives the deleted row count directly
-        conn.commit()
-        return count
-    finally:
-        conn.close()
+    supabase = get_supabase_client()
+
+    # Fetch count before deleting so we can return it
+    count_response = (
+        supabase.table("chunks")
+        .select("id", count="exact")
+        .eq("student_id", student_id)
+        .execute()
+    )
+    count = count_response.count or 0
+
+    supabase.table("chunks").delete().eq("student_id", student_id).execute()
+
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -192,8 +178,8 @@ async def save_document_record(
       file_path   TEXT NOT NULL
       created_at  TIMESTAMPTZ DEFAULT now()
     """
-    # Use supabase-py for the simple insert — no vector types involved
     supabase = get_supabase_client()
+
     response = (
         supabase.table("documents")
         .insert({
