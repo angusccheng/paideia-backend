@@ -7,6 +7,30 @@ import json
 
 from services.processor import get_openai_client
 
+
+def _parse_gpt_json(raw: str) -> dict:
+    """
+    Parse a JSON string that GPT may have wrapped in markdown code fences.
+    Strips ```json ... ``` or ``` ... ``` before parsing.
+    Returns a safe fallback dict if parsing still fails.
+    """
+    text = raw.strip()
+    # Remove opening fence: ```json or ```
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]  # drop the first line (``` or ```json)
+    # Remove closing fence
+    if text.endswith("```"):
+        text = text.rsplit("```", 1)[0]
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {
+            "concepts_assessed": [],
+            "concepts_not_covered": [],
+            "summary": "Session complete. Report could not be generated.",
+        }
+
 # ---------------------------------------------------------------------------
 # System prompt — context-locked tutor persona
 # ---------------------------------------------------------------------------
@@ -177,12 +201,4 @@ async def generate_session_report(
     )
 
     raw = response.choices[0].message.content.strip()
-    try:
-        return json.loads(raw)
-    except Exception:
-        # JSON parsing failed — return a safe fallback
-        return {
-            "concepts_assessed": [],
-            "concepts_not_covered": [],
-            "summary": raw,  # return the raw text as the summary rather than losing it
-        }
+    return _parse_gpt_json(raw)

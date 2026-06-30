@@ -135,6 +135,24 @@ TEXT:
 """
 
 
+def _strip_and_parse_json(raw: str) -> dict:
+    """
+    Parse a JSON string that GPT may have wrapped in markdown code fences.
+    Strips ```json ... ``` or ``` ... ``` before parsing.
+    Returns an empty dict if parsing still fails.
+    """
+    text = raw.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]
+    if text.endswith("```"):
+        text = text.rsplit("```", 1)[0]
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {}
+
+
 def _call_structure_gpt(text_section: str) -> dict:
     """
     Send one section of text to GPT-4o-mini and parse the returned JSON structure.
@@ -144,15 +162,12 @@ def _call_structure_gpt(text_section: str) -> dict:
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": STRUCTURE_PROMPT + text_section}],
-        temperature=0,          # deterministic — we need consistent JSON
+        temperature=0,
         max_tokens=2000,
         response_format={"type": "json_object"},
     )
     raw = response.choices[0].message.content.strip()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {}
+    return _strip_and_parse_json(raw)
 
 
 def extract_structure(text: str) -> dict:
