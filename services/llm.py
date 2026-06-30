@@ -101,38 +101,9 @@ async def get_llm_response(
 # Session report — mastery assessment after conversation ends
 # ---------------------------------------------------------------------------
 
-REPORT_PROMPT = """You are Paideia, an AI academic tutor. A tutoring session just ended.
-Below is the full conversation transcript and the list of concepts that came up during the session.
-Assess the student's understanding of each concept based solely on how they answered.
-
-Return ONLY valid JSON in exactly this format — no markdown, no explanation:
-{
-  "concepts_assessed": [
-    {
-      "concept": "concept name",
-      "lesson": "lesson name",
-      "mastery": "strong" or "developing" or "weak",
-      "evidence": "one sentence explaining why, based on the student's actual responses"
-    }
-  ],
-  "concepts_not_covered": ["concept name", "concept name"],
-  "summary": "2-3 sentence natural language summary of the session, written as Paideia speaking directly to the student"
-}
-
-Mastery definitions:
-- strong: student answered correctly and showed clear understanding
-- developing: student had partial understanding or needed hints
-- weak: student struggled, gave wrong answers, or did not engage with the concept
-
-CONVERSATION TRANSCRIPT:
-{transcript}
-
-CONCEPTS TOUCHED IN THIS SESSION:
-{concepts_touched}
-
-ALL CONCEPTS IN STUDENT'S NOTES (for concepts_not_covered):
-{full_concept_map}
-"""
+# REPORT_PROMPT is built inside generate_session_report as an f-string
+# so that {{ }} can escape the literal JSON braces in the example
+# while {transcript}, {concepts_touched_str}, {full_map_str} remain live variables.
 
 
 async def generate_session_report(
@@ -185,11 +156,40 @@ async def generate_session_report(
         f"- {c.get('concept', '')} (from: {c.get('lesson', '')})" for c in full_concept_map
     ) or "No notes uploaded"
 
-    prompt = REPORT_PROMPT.format(
-        transcript=transcript,
-        concepts_touched=concepts_touched_str,
-        full_concept_map=full_map_str,
-    )
+    # Build the prompt as an f-string so {{ }} escapes literal JSON braces
+    # while {transcript}, {concepts_touched_str}, {full_map_str} are substituted normally.
+    prompt = f"""You are Paideia, an AI academic tutor. A tutoring session just ended.
+Below is the full conversation transcript and the list of concepts that came up during the session.
+Assess the student's understanding of each concept based solely on how they answered.
+
+Return ONLY valid JSON in exactly this format — no markdown, no explanation:
+{{
+  "concepts_assessed": [
+    {{
+      "concept": "concept name",
+      "lesson": "lesson name",
+      "mastery": "strong or developing or weak",
+      "evidence": "one sentence explaining why, based on the student's actual responses"
+    }}
+  ],
+  "concepts_not_covered": ["concept name", "concept name"],
+  "summary": "2-3 sentence summary written as Paideia speaking directly to the student"
+}}
+
+Mastery definitions:
+- strong: student answered correctly and showed clear understanding
+- developing: student had partial understanding or needed hints
+- weak: student struggled, gave wrong answers, or did not engage with the concept
+
+CONVERSATION TRANSCRIPT:
+{transcript}
+
+CONCEPTS TOUCHED IN THIS SESSION:
+{concepts_touched_str}
+
+ALL CONCEPTS IN STUDENT'S NOTES (for concepts_not_covered):
+{full_map_str}
+"""
 
     client = get_openai_client()
     response = client.chat.completions.create(
