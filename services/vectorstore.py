@@ -60,6 +60,7 @@ async def upsert_chunks(
 
     # Build the rows list — embedding is passed as a plain Python list,
     # which Supabase serialises as a JSON array. pgvector accepts this format.
+    # lesson and concept come from the semantic chunking pipeline.
     rows = [
         {
             "id": ids[i],
@@ -67,7 +68,9 @@ async def upsert_chunks(
             "source": metadatas[i].get("source", "unknown"),
             "chunk_index": metadatas[i].get("chunk_index", i),
             "content": chunks[i],
-            "embedding": embeddings[i],   # list[float] → pgvector accepts JSON array
+            "embedding": embeddings[i],
+            "lesson": metadatas[i].get("lesson", "Unknown"),
+            "concept": metadatas[i].get("concept", "Unknown"),
         }
         for i in range(len(chunks))
     ]
@@ -156,6 +159,43 @@ async def delete_student_collection(student_id: str) -> int:
     supabase.table("chunks").delete().eq("student_id", student_id).execute()
 
     return count
+
+
+# ---------------------------------------------------------------------------
+# Concept map — what topics exist in a student's uploaded material
+# ---------------------------------------------------------------------------
+
+async def get_concept_summary(student_id: str) -> list[dict]:
+    """
+    Return all distinct lesson/concept combinations for a student.
+    Useful for building a topic map in the frontend or for session planning.
+
+    Returns a list like:
+      [
+        { "lesson": "Lesson 1: Colonial Foundations", "concept": "Jamestown Settlement" },
+        { "lesson": "Lesson 1: Colonial Foundations", "concept": "Tobacco Economy" },
+        ...
+      ]
+    """
+    supabase = get_supabase_client()
+
+    response = (
+        supabase.table("chunks")
+        .select("lesson, concept")
+        .eq("student_id", student_id)
+        .execute()
+    )
+
+    # Deduplicate lesson+concept pairs while preserving order
+    seen = set()
+    results = []
+    for row in (response.data or []):
+        key = (row.get("lesson", ""), row.get("concept", ""))
+        if key not in seen:
+            seen.add(key)
+            results.append({"lesson": key[0], "concept": key[1]})
+
+    return results
 
 
 # ---------------------------------------------------------------------------
