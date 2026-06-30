@@ -3,6 +3,8 @@ llm.py — LLM interaction via GPT-4o-mini.
 Builds the tutor prompt and handles conversation history.
 """
 
+import json
+
 from services.processor import get_openai_client
 
 # ---------------------------------------------------------------------------
@@ -69,3 +71,118 @@ async def get_llm_response(
     )
 
     return response.choices[0].message.content.strip()
+
+
+# ---------------------------------------------------------------------------
+# Session report — mastery assessment after conversation ends
+# ---------------------------------------------------------------------------
+
+REPORT_PROMPT = """You are Paideia, an AI academic tutor. A tutoring session just ended.
+Below is the full conversation transcript and the list of concepts that came up during the session.
+Assess the student's understanding of each concept based solely on how they answered.
+
+Return ONLY valid JSON in exactly this format — no markdown, no explanation:
+{
+  "concepts_assessed": [
+    {
+      "concept": "concept name",
+      "lesson": "lesson name",
+      "mastery": "strong" or "developing" or "weak",
+      "evidence": "one sentence explaining why, based on the student's actual responses"
+    }
+  ],
+  "concepts_not_covered": ["concept name", "concept name"],
+  "summary": "2-3 sentence natural language summary of the session, written as Paideia speaking directly to the student"
+}
+
+Mastery definitions:
+- strong: student answered correctly and showed clear understanding
+- developing: student had partial understanding or needed hints
+- weak: student struggled, gave wrong answers, or did not engage with the concept
+
+CONVERSATION TRANSCRIPT:
+{transcript}
+
+CONCEPTS TOUCHED IN THIS SESSION:
+{concepts_touched}
+
+ALL CONCEPTS IN STUDENT'S NOTES (for concepts_not_covered):
+{full_concept_map}
+"""
+
+
+async def generate_session_report(
+    conversation_history: list[dict],
+    concepts_touched: list[dict],
+    full_concept_map: list[dict],
+) -> dict:
+    """
+    Assess student mastery after a session ends.
+
+    conversation_history: list of {role, content} dicts from the session
+    concepts_touched: list of {lesson, concept, chunk_content} dicts —
+                      every concept retrieved from the notes during the session
+    full_concept_map: list of {lesson, concept} dicts — everything in the
+                      student's uploaded notes (from get_concept_summary)
+
+    Returns a report dict with concepts_assessed, concepts_not_covered, summary.
+    Returns a minimal report if the session was too short to assess.
+    """
+    # Graceful handling for empty sessions
+    if not conversation_history:
+        return {
+            "concepts_assessed": [],
+            "concepts_not_covered": [c.get("concept", "") for c in full_concept_map],
+            "summary": "The session ended before any conversation took place.",
+        }
+
+    # Build a readable transcript from the history
+    transcript_lines = []
+    for turn in conversation_history:
+        role = "Student" if turn.get("role") == "user" else "Paideia"
+        transcript_lines.append(f"{role}: {turn.get('content', '')}")
+    transcript = "\n".join(transcript_lines)
+
+    # Deduplicate concepts_touched by lesson+concept pair for the prompt
+    seen = set()
+    unique_concepts = []
+    for c in concepts_touched:
+        key = (c.get("lesson", ""), c.get("concept", ""))
+        if key not in seen:
+            seen.add(key)
+            unique_concepts.append({"lesson": key[0], "concept": key[1]})
+
+    # Format the concept lists as readable strings for the prompt
+    concepts_touched_str = "\n".join(
+        f"- {c['concept']} (from: {c['lesson']})" for c in unique_concepts
+    ) or "None"
+
+    full_map_str = "\n".join(
+        f"- {c.get('concept', '')} (from: {c.get('lesson', '')})" for c in full_concept_map
+    ) or "No notes uploaded"
+
+    prompt = REPORT_PROMPT.format(
+        transcript=transcript,
+        concepts_touched=concepts_touched_str,
+        full_concept_map=full_map_str,
+    )
+
+    client = get_openai_client()
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0,
+        max_tokens=1500,
+        response_format={"type": "json_object"},
+    )
+
+    raw = response.choices[0].message.content.strip()
+    try:
+        return json.loads(raw)
+    except Exception:
+        # JSON parsing failed — return a safe fallback
+        return {
+            "concepts_assessed": [],
+            "concepts_not_covered": [],
+            "summary": raw,  # return the raw text as the summary rather than losing it
+        }

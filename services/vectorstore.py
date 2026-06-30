@@ -82,23 +82,26 @@ async def query_chunks(
     student_id: str,
     query_embedding: list[float],
     top_k: int = 5,
-) -> list[str]:
+) -> list[dict]:
     """
     Find the top_k most semantically similar chunks for this student.
 
-    Calls the 'match_chunks' Postgres function via supabase.rpc().
-    That function runs the pgvector <=> cosine distance query server-side,
-    which avoids needing a direct database connection from Python.
+    Returns a list of dicts with keys: content, lesson, concept.
+    Callers that only need the text can pull chunk["content"].
+    The lesson and concept fields are used by the session report
+    to track which topics were touched during the conversation.
 
-    The SQL function must exist in your Supabase database:
+    Calls the 'match_chunks' Postgres function via supabase.rpc().
+    That function must be updated to also return lesson and concept:
+
       create or replace function match_chunks(
         p_student_id text,
         p_embedding  vector(1536),
         p_limit      int
       )
-      returns table(content text)
+      returns table(content text, lesson text, concept text)
       language sql as $$
-        select content from chunks
+        select content, lesson, concept from chunks
         where student_id = p_student_id
         order by embedding <=> p_embedding
         limit p_limit;
@@ -110,12 +113,19 @@ async def query_chunks(
         "match_chunks",
         {
             "p_student_id": student_id,
-            "p_embedding": query_embedding,   # passed as JSON array
+            "p_embedding": query_embedding,
             "p_limit": top_k,
         },
     ).execute()
 
-    return [row["content"] for row in (response.data or [])]
+    return [
+        {
+            "content": row.get("content", ""),
+            "lesson": row.get("lesson", "Unknown"),
+            "concept": row.get("concept", "Unknown"),
+        }
+        for row in (response.data or [])
+    ]
 
 
 async def list_collections_for_student(student_id: str) -> list[str]:

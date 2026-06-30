@@ -67,7 +67,8 @@ async def query_documents(body: QueryRequest):
             },
         )
 
-    context_string = "\n\n".join(chunks)
+    # query_chunks now returns dicts with content/lesson/concept — extract text only
+    context_string = "\n\n".join(c["content"] for c in chunks)
 
     return JSONResponse(
         status_code=200,
