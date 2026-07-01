@@ -3,7 +3,6 @@ stt.py — Speech-to-Text using OpenAI Whisper.
 Converts raw audio bytes into a transcribed text string.
 """
 
-import io
 from services.processor import get_openai_client
 
 # Audio formats Whisper accepts — we pass the mime type so the API
@@ -27,13 +26,14 @@ async def transcribe(audio_bytes: bytes, mime_type: str = "webm") -> str:
     if fmt not in SUPPORTED_FORMATS:
         fmt = "webm"  # safe default for browser-recorded audio
 
-    # Whisper expects a file-like object with a .name attribute
-    audio_file = io.BytesIO(audio_bytes)
-    audio_file.name = f"audio.{fmt}"
+    # Whisper requires a (filename, bytes, mime_type) tuple so it can
+    # detect the codec from the extension — a plain BytesIO without a
+    # recognised filename causes a 400 "invalid file format" error.
+    file_tuple = (f"audio.{fmt}", audio_bytes, f"audio/{fmt}")
 
     response = client.audio.transcriptions.create(
         model="whisper-1",
-        file=audio_file,
+        file=file_tuple,
         response_format="text",
     )
 

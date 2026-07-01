@@ -72,20 +72,26 @@ async def get_llm_response(
     student_message: str,
     context: str,
     history: list[dict],
+    override_instruction: str = "",
 ) -> str:
     """
     Call GPT-4o-mini and return the assistant's reply as a plain string.
 
     history: list of {"role": "user"|"assistant", "content": "..."} dicts
-             representing the conversation so far (not including the current message).
-    context: the RAG-retrieved text from ChromaDB.
+    context: RAG-retrieved text from the student's notes
+    override_instruction: if set, replaces the normal user turn with a
+                          one-off system instruction (used for greetings etc.)
     """
     client = get_openai_client()
 
-    # Build messages: system prompt (with context) + prior history + new user turn
     messages = build_tutor_prompt(context, student_message)
     messages.extend(history)
-    messages.append({"role": "user", "content": student_message})
+
+    if override_instruction:
+        # Inject the instruction as a system message — no user turn needed
+        messages.append({"role": "system", "content": override_instruction})
+    else:
+        messages.append({"role": "user", "content": student_message})
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",

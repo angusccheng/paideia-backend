@@ -70,6 +70,32 @@ async def voice_session(websocket: WebSocket, student_id: str):
             msg_type = message.get("type")
 
             # ------------------------------------------------------------------
+            # START_SESSION — send a warm greeting, no RAG needed
+            # ------------------------------------------------------------------
+            if msg_type == "START_SESSION":
+                try:
+                    greeting = await get_llm_response(
+                        student_message="",
+                        context="",
+                        history=[],
+                        override_instruction=(
+                            "The session is just starting. Greet the student warmly, "
+                            "tell them you have access to their uploaded notes, and ask "
+                            "what they want to focus on or what they already know about "
+                            "the topic. Keep it to 2 sentences max."
+                        ),
+                    )
+                    await websocket.send_text(json.dumps({"type": "response", "text": greeting}))
+                    audio_bytes = await speak(greeting)
+                    await websocket.send_text(json.dumps({
+                        "type": "audio",
+                        "data": base64.b64encode(audio_bytes).decode("utf-8"),
+                    }))
+                except Exception as e:
+                    await websocket.send_text(json.dumps({"type": "error", "message": f"Greeting failed: {e}"}))
+                continue
+
+            # ------------------------------------------------------------------
             # Audio input — transcribe, then RAG + LLM + TTS
             # ------------------------------------------------------------------
             if msg_type == "audio":
@@ -86,7 +112,9 @@ async def voice_session(websocket: WebSocket, student_id: str):
                     continue
 
                 try:
-                    transcript = await transcribe(audio_bytes, mime_type)
+                    # Always pass audio/webm — browsers record in webm format
+                    # and Whisper needs the correct extension to decode it
+                    transcript = await transcribe(audio_bytes, "audio/webm")
                 except Exception as e:
                     await websocket.send_text(json.dumps({
                         "type": "error", "message": f"Transcription failed: {e}",
