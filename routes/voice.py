@@ -50,9 +50,12 @@ async def voice_session(websocket: WebSocket, student_id: str):
     history: list[dict] = []
 
     # Concept tracking — every chunk retrieved during this session.
-    # Each entry: { "lesson": "...", "concept": "...", "chunk_content": "..." }
-    # Used at the end to build the mastery report.
     concepts_touched: list[dict] = []
+
+    # Audio buffer — accumulates raw bytes across multiple "audio" messages
+    # until "end_of_speech" signals the student has finished speaking.
+    # Individual 250ms chunks are too small for Whisper to recognise as valid audio.
+    audio_buffer: list[bytes] = []
 
     try:
         while True:
@@ -96,25 +99,32 @@ async def voice_session(websocket: WebSocket, student_id: str):
                 continue
 
             # ------------------------------------------------------------------
-            # Audio input — transcribe, then RAG + LLM + TTS
+            # Audio chunk — accumulate into buffer, do NOT transcribe yet.
+            # Individual 250ms chunks are too small for Whisper.
             # ------------------------------------------------------------------
             if msg_type == "audio":
                 audio_b64 = message.get("data", "")
-                mime_type = message.get("mime_type", "webm")
-
                 try:
-                    audio_bytes = base64.b64decode(audio_b64)
+                    audio_buffer.append(base64.b64decode(audio_b64))
                 except Exception:
                     await websocket.send_text(json.dumps({
                         "type": "error",
                         "message": "Could not decode base64 audio data.",
                     }))
+                continue
+
+            # ------------------------------------------------------------------
+            # End of speech — combine buffered chunks and transcribe once
+            # ------------------------------------------------------------------
+            elif msg_type == "end_of_speech":
+                if not audio_buffer:
                     continue
 
+                combined = b"".join(audio_buffer)
+                audio_buffer.clear()
+
                 try:
-                    # Always pass audio/webm — browsers record in webm format
-                    # and Whisper needs the correct extension to decode it
-                    transcript = await transcribe(audio_bytes, "audio/webm")
+                    transcript = await transcribe(combined, "audio/webm")
                 except Exception as e:
                     await websocket.send_text(json.dumps({
                         "type": "error", "message": f"Transcription failed: {e}",
@@ -133,7 +143,7 @@ async def voice_session(websocket: WebSocket, student_id: str):
                 student_text = transcript
 
             # ------------------------------------------------------------------
-            # Text input — skip transcription
+            # Text input — skip transcription entirely
             # ------------------------------------------------------------------
             elif msg_type == "text":
                 student_text = message.get("text", "").strip()
@@ -142,7 +152,7 @@ async def voice_session(websocket: WebSocket, student_id: str):
             else:
                 await websocket.send_text(json.dumps({
                     "type": "error",
-                    "message": f"Unknown message type '{msg_type}'. Use 'audio' or 'text'.",
+                    "message": f"Unknown message type '{msg_type}'. Use 'audio', 'end_of_speech', or 'text'.",
                 }))
                 continue
 
